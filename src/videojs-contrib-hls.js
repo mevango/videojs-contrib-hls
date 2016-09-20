@@ -10,39 +10,16 @@ import document from 'global/document';
 import PlaylistLoader from './playlist-loader';
 import Playlist from './playlist';
 import xhrFactory from './xhr';
-import {Decrypter, AsyncStream, decrypt} from './decrypter';
+import {Decrypter, AsyncStream, decrypt} from 'aes-decrypter';
 import utils from './bin-utils';
 import {MediaSource, URL} from 'videojs-contrib-media-sources';
-import m3u8 from './m3u8';
+import m3u8 from 'm3u8-parser';
 import videojs from 'video.js';
-import MasterPlaylistController from './master-playlist-controller';
-
-/**
- * determine if an object a is differnt from
- * and object b. both only having one dimensional
- * properties
- *
- * @param {Object} a object one
- * @param {Object} b object two
- * @return {Boolean} if the object has changed or not
- */
-const objectChanged = function(a, b) {
-  if (typeof a !== typeof b) {
-    return true;
-  }
-  // if we have a different number of elements
-  // something has changed
-  if (Object.keys(a).length !== Object.keys(b).length) {
-    return true;
-  }
-
-  for (let prop in a) {
-    if (!b[prop] || a[prop] !== b[prop]) {
-      return true;
-    }
-  }
-  return false;
-};
+import { MasterPlaylistController } from './master-playlist-controller';
+import Config from './config';
+import renditionSelectionMixin from './rendition-mixin';
+import GapSkipper from './gap-skipper';
+import window from 'global/window';
 
 const Hls = {
   PlaylistLoader,
@@ -54,8 +31,23 @@ const Hls = {
   xhr: xhrFactory()
 };
 
-// the desired length of video to maintain in the buffer, in seconds
-Hls.GOAL_BUFFER_LENGTH = 30;
+Object.defineProperty(Hls, 'GOAL_BUFFER_LENGTH', {
+  get() {
+    videojs.log.warn('using Hls.GOAL_BUFFER_LENGTH is UNSAFE be sure ' +
+                     'you know what you are doing');
+    return Config.GOAL_BUFFER_LENGTH;
+  },
+  set(v) {
+    videojs.log.warn('using Hls.GOAL_BUFFER_LENGTH is UNSAFE be sure ' +
+                     'you know what you are doing');
+    if (typeof v !== 'number' || v <= 0) {
+      videojs.log.warn('value passed to Hls.GOAL_BUFFER_LENGTH ' +
+                       'must be a number and greater than 0');
+      return;
+    }
+    Config.GOAL_BUFFER_LENGTH = v;
+  }
+});
 
 // A fudge factor to apply to advertised playlist bitrates to account for
 // temporary flucations in client bandwidth
@@ -78,7 +70,7 @@ const safeGetComputedStyle = function(el, property) {
     return '';
   }
 
-  result = getComputedStyle(el);
+  result = window.getComputedStyle(el);
   if (!result) {
     return '';
   }
@@ -285,15 +277,13 @@ class HlsHandler extends Component {
       }
     }
 
-    this.options_ = videojs.mergeOptions(videojs.options.hls || {}, options.hls);
     this.tech_ = tech;
     this.source_ = source;
+    this.stats = {};
 
-    // start playlist selection at a reasonable bandwidth for
-    // broadband internet
-    // 0.5 Mbps
-    this.bandwidth = this.options_.bandwidth || 4194304;
-    this.bytesReceived = 0;
+    // handle global & Source Handler level options
+    this.options_ = videojs.mergeOptions(videojs.options.hls || {}, options.hls);
+    this.setOptions_();
 
     // listen for fullscreenchange events for this player so that we
     // can adjust our quality selection quickly
@@ -321,13 +311,31 @@ class HlsHandler extends Component {
     });
 
     this.audioTrackChange_ = () => {
-      this.masterPlaylistController_.useAudio();
+      this.masterPlaylistController_.setupAudio();
     };
 
     this.on(this.tech_, 'play', this.play);
     this.on(this.tech_, 'timeupdate', this.timeupdate);
   }
 
+  setOptions_() {
+    // defaults
+    this.options_.withCredentials = this.options_.withCredentials || false;
+
+    // start playlist selection at a reasonable bandwidth for
+    // broadband internet
+    // 0.5 MB/s
+    this.options_.bandwidth = this.options_.bandwidth || 4194304;
+
+    // grab options passed to player.src
+    ['withCredentials', 'bandwidth'].forEach((option) => {
+      if (typeof this.source_[option] !== 'undefined') {
+        this.options_[option] = this.source_[option];
+      }
+    });
+
+    this.bandwidth = this.options_.bandwidth;
+  }
   /**
    * called when player.src gets called, handle a new source
    *
@@ -338,21 +346,19 @@ class HlsHandler extends Component {
     if (!src) {
       return;
     }
-
-    ['withCredentials', 'bandwidth'].forEach((option) => {
-      if (typeof this.source_[option] !== 'undefined') {
-        this.options_[option] = this.source_[option];
-      }
-    });
+    this.setOptions_();
+    // add master playlist controller options
     this.options_.url = this.source_.src;
     this.options_.tech = this.tech_;
     this.options_.externHls = Hls;
-    this.options_.bandwidth = this.bandwidth;
     this.masterPlaylistController_ = new MasterPlaylistController(this.options_);
+    this.gapSkipper_ = new GapSkipper(this.options_);
+
     // `this` in selectPlaylist should be the HlsHandler for backwards
     // compatibility with < v2
     this.masterPlaylistController_.selectPlaylist =
-      Hls.STANDARD_PLAYLIST_SELECTOR.bind(this);
+      this.selectPlaylist ?
+        this.selectPlaylist.bind(this) : Hls.STANDARD_PLAYLIST_SELECTOR.bind(this);
 
     // re-expose some internal objects for backwards compatibility with < v2
     this.playlists = this.masterPlaylistController_.masterPlaylistLoader_;
@@ -380,6 +386,25 @@ class HlsHandler extends Component {
       }
     });
 
+    Object.defineProperties(this.stats, {
+      bandwidth: {
+        get: () => this.bandwidth || 0,
+        enumerable: true
+      },
+      mediaRequests: {
+        get: () => this.masterPlaylistController_.mediaRequests_() || 0,
+        enumerable: true
+      },
+      mediaTransferDuration: {
+        get: () => this.masterPlaylistController_.mediaTransferDuration_() || 0,
+        enumerable: true
+      },
+      mediaBytesTransferred: {
+        get: () => this.masterPlaylistController_.mediaBytesTransferred_() || 0,
+        enumerable: true
+      }
+    });
+
     this.tech_.one('canplay',
       this.masterPlaylistController_.setupFirstPlay.bind(this.masterPlaylistController_));
 
@@ -387,55 +412,16 @@ class HlsHandler extends Component {
       this.tech_.audioTracks().addEventListener('change', this.audioTrackChange_);
     });
 
-    this.masterPlaylistController_.on('audioinfo', (e) => {
-      if (!videojs.browser.IS_FIREFOX ||
-          !this.audioInfo_ ||
-          !objectChanged(this.audioInfo_, e.info)) {
-        this.audioInfo_ = e.info;
-        return;
-      }
-
-      let error = 'had different audio properties (channels, sample rate, etc.) ' +
-                  'or changed in some other way.  This behavior is currently ' +
-                  'unsupported in Firefox due to an issue: \n\n' +
-                  'https://bugzilla.mozilla.org/show_bug.cgi?id=1247138\n\n';
-
-      let enabledTrack;
-      let defaultTrack;
-
-      this.masterPlaylistController_.audioTracks_.forEach((t) => {
-        if (!defaultTrack && t.default) {
-          defaultTrack = t;
-        }
-
-        if (!enabledTrack && t.enabled) {
-          enabledTrack = t;
-        }
-      });
-
-      // they did not switch audiotracks
-      // blacklist the current playlist
-      if (!enabledTrack.getLoader(this.activeAudioGroup_())) {
-        error = `The rendition that we tried to switch to ${error}` +
-                'Unfortunately that means we will have to blacklist ' +
-                'the current playlist and switch to another. Sorry!';
-        this.masterPlaylistController_.blacklistCurrentPlaylist();
-      } else {
-        error = `The audio track '${enabledTrack.label}' that we tried to ` +
-                `switch to ${error} Unfortunately this means we will have to ` +
-                `return you to the main track '${defaultTrack.label}'. Sorry!`;
-        defaultTrack.enabled = true;
-        this.tech_.audioTracks().removeTrack(enabledTrack);
-      }
-
-      videojs.log.warn(error);
-      this.masterPlaylistController_.useAudio();
-    });
     this.masterPlaylistController_.on('selectedinitialmedia', () => {
+      // Add the manual rendition mix-in to HlsHandler
+      renditionSelectionMixin(this);
+    });
+
+    this.masterPlaylistController_.on('audioupdate', () => {
       // clear current audioTracks
       this.tech_.clearTracks('audio');
-      this.masterPlaylistController_.audioTracks_.forEach((track) => {
-        this.tech_.audioTracks().addTrack(track);
+      this.masterPlaylistController_.activeAudioGroup().forEach((audioTrack) => {
+        this.tech_.audioTracks().addTrack(audioTrack);
       });
     });
 
@@ -507,8 +493,8 @@ class HlsHandler extends Component {
     if (this.masterPlaylistController_) {
       this.masterPlaylistController_.dispose();
     }
+    this.gapSkipper_.dispose();
     this.tech_.audioTracks().removeEventListener('change', this.audioTrackChange_);
-
     super.dispose();
   }
 }

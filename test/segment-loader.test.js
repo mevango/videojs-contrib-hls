@@ -1,42 +1,15 @@
 import QUnit from 'qunit';
-import {GOAL_BUFFER_LENGTH, default as SegmentLoader} from '../src/segment-loader';
+import SegmentLoader from '../src/segment-loader';
 import videojs from 'video.js';
 import xhrFactory from '../src/xhr';
-import { useFakeEnvironment, useFakeMediaSource } from './test-helpers.js';
-
-const playlistWithDuration = function(time, conf) {
-  let result = {
-    mediaSequence: conf && conf.mediaSequence ? conf.mediaSequence : 0,
-    discontinuityStarts: [],
-    segments: [],
-    endList: true
-  };
-  let count = Math.floor(time / 10);
-  let remainder = time % 10;
-  let i;
-  let isEncrypted = conf && conf.isEncrypted;
-
-  for (i = 0; i < count; i++) {
-    result.segments.push({
-      uri: i + '.ts',
-      resolvedUri: i + '.ts',
-      duration: 10
-    });
-    if (isEncrypted) {
-      result.segments[i].key = {
-        uri: i + '-key.php',
-        resolvedUri: i + '-key.php'
-      };
-    }
-  }
-  if (remainder) {
-    result.segments.push({
-      uri: i + '.ts',
-      duration: remainder
-    });
-  }
-  return result;
-};
+import mp4probe from 'mux.js/lib/mp4/probe';
+import Config from '../src/config';
+import {
+  playlistWithDuration,
+  useFakeEnvironment,
+  useFakeMediaSource
+} from './test-helpers.js';
+import sinon from 'sinon';
 
 let currentTime;
 let mediaSource;
@@ -56,6 +29,9 @@ QUnit.module('Segment Loader', {
       xhr: xhrFactory()
     };
 
+    this.timescale = sinon.stub(mp4probe, 'timescale');
+    this.startTime = sinon.stub(mp4probe, 'startTime');
+
     currentTime = 0;
     mediaSource = new videojs.MediaSource();
     mediaSource.trigger('sourceopen');
@@ -73,6 +49,8 @@ QUnit.module('Segment Loader', {
   afterEach() {
     this.env.restore();
     this.mse.restore();
+    this.timescale.restore();
+    this.startTime.restore();
   }
 });
 
@@ -138,6 +116,11 @@ QUnit.test('calling load is idempotent', function() {
   this.requests.shift().respond(200, null, '');
   loader.load();
   QUnit.equal(this.requests.length, 0, 'load has no effect');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaTransferDuration, 100, '100 ms (clock above)');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('calling load should unpause', function() {
@@ -147,7 +130,6 @@ QUnit.test('calling load should unpause', function() {
   loader.pause();
 
   loader.mimeType(this.mimeType);
-  sourceBuffer = mediaSource.sourceBuffers[0];
 
   loader.load();
   QUnit.equal(loader.paused(), false, 'loading unpauses');
@@ -162,12 +144,18 @@ QUnit.test('calling load should unpause', function() {
   QUnit.equal(loader.paused(), false, 'unpaused during processing');
 
   loader.pause();
+  sourceBuffer = mediaSource.sourceBuffers[0];
   sourceBuffer.trigger('updateend');
   QUnit.equal(loader.state, 'READY', 'finished processing');
   QUnit.ok(loader.paused(), 'stayed paused');
 
   loader.load();
   QUnit.equal(loader.paused(), false, 'unpaused');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaTransferDuration, 1, '1 ms (clock above)');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('regularly checks the buffer while unpaused', function() {
@@ -183,15 +171,20 @@ QUnit.test('regularly checks the buffer while unpaused', function() {
   this.requests[0].response = new Uint8Array(10).buffer;
   this.requests.shift().respond(200, null, '');
   sourceBuffer.buffered = videojs.createTimeRanges([[
-    0, GOAL_BUFFER_LENGTH
+    0, Config.GOAL_BUFFER_LENGTH
   ]]);
   sourceBuffer.trigger('updateend');
   QUnit.equal(this.requests.length, 0, 'no outstanding requests');
 
   // play some video to drain the buffer
-  currentTime = GOAL_BUFFER_LENGTH;
+  currentTime = Config.GOAL_BUFFER_LENGTH;
   this.clock.tick(10 * 1000);
   QUnit.equal(this.requests.length, 1, 'requested another segment');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaTransferDuration, 1, '1 ms (clock above)');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('does not check the buffer while paused', function() {
@@ -210,6 +203,11 @@ QUnit.test('does not check the buffer while paused', function() {
 
   this.clock.tick(10 * 1000);
   QUnit.equal(this.requests.length, 0, 'did not make a request');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaTransferDuration, 1, '1 ms (clock above)');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('calculates bandwidth after downloading a segment', function() {
@@ -224,7 +222,12 @@ QUnit.test('calculates bandwidth after downloading a segment', function() {
 
   QUnit.equal(loader.bandwidth, (10 / 100) * 8 * 1000, 'calculated bandwidth');
   QUnit.equal(loader.roundTrip, 100, 'saves request round trip time');
-  QUnit.equal(loader.bytesReceived, 10, 'saves bytes received');
+
+  // TODO: Bandwidth Stat will be stale??
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaTransferDuration, 100, '100 ms (clock above)');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('segment request timeouts reset bandwidth', function() {
@@ -238,6 +241,32 @@ QUnit.test('segment request timeouts reset bandwidth', function() {
 
   QUnit.equal(loader.bandwidth, 1, 'reset bandwidth');
   QUnit.ok(isNaN(loader.roundTrip), 'reset round trip time');
+});
+
+QUnit.test('updates timestamps when segments do not start at zero', function() {
+  let playlist = playlistWithDuration(10);
+
+  playlist.segments.forEach((segment) => {
+    segment.map = {
+      resolvedUri: 'init.mp4',
+      bytes: new Uint8Array(10)
+    };
+  });
+  loader.playlist(playlist);
+  loader.mimeType('video/mp4');
+  loader.load();
+
+  this.startTime.returns(11);
+
+  this.clock.tick(100);
+  // init
+  this.requests[0].response = new Uint8Array(10).buffer;
+  this.requests.shift().respond(200, null, '');
+  // segment
+  this.requests[0].response = new Uint8Array(10).buffer;
+  this.requests.shift().respond(200, null, '');
+
+  QUnit.equal(loader.sourceUpdater_.timestampOffset(), -11, 'set timestampOffset');
 });
 
 QUnit.test('appending a segment triggers progress', function() {
@@ -256,6 +285,10 @@ QUnit.test('appending a segment triggers progress', function() {
   mediaSource.sourceBuffers[0].trigger('updateend');
 
   QUnit.equal(progresses, 1, 'fired progress');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('only requests one segment at a time', function() {
@@ -284,6 +317,11 @@ QUnit.test('only appends one segment at a time', function() {
   QUnit.equal(mediaSource.sourceBuffers[0].updates_.filter(
     update => update.append).length, 1, 'only one append');
   QUnit.equal(this.requests.length, 0, 'only made one request');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaTransferDuration, 100, '100 ms (clock above)');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('adjusts the playlist offset if no buffering progress is made', function() {
@@ -321,6 +359,11 @@ QUnit.test('adjusts the playlist offset if no buffering progress is made', funct
 
   // so the loader should try the next segment
   QUnit.equal(this.requests[0].url, '1.ts', 'moved ahead a segment');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 20, '20 bytes');
+  QUnit.equal(loader.mediaTransferDuration, 2, '2 ms (clocks above)');
+  QUnit.equal(loader.mediaRequests, 2, '2 requests');
 });
 
 QUnit.test('never attempt to load a segment that ' +
@@ -350,15 +393,13 @@ QUnit.test('never attempt to load a segment that ' +
   sourceBuffer.buffered = videojs.createTimeRanges([[0, 9.2]]);
   sourceBuffer.trigger('updateend');
 
-  // the next segment doesn't increase the buffer at all
-  QUnit.equal(this.requests[0].url, '1.ts', 'requested the next segment');
-  this.clock.tick(1);
-  this.requests[0].response = new Uint8Array(10).buffer;
-  this.requests.shift().respond(200, null, '');
-  sourceBuffer.trigger('updateend');
-
-  // so the loader should try the next segment
+  // the loader should move on to the next segment
   QUnit.equal(this.requests[0].url, '1.ts', 'moved ahead a segment');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaTransferDuration, 1, '1 ms (clocks above)');
+  QUnit.equal(loader.mediaRequests, 1, '1 requests');
 });
 
 QUnit.test('adjusts the playlist offset if no buffering progress is made', function() {
@@ -396,6 +437,180 @@ QUnit.test('adjusts the playlist offset if no buffering progress is made', funct
 
   // so the loader should try the next segment
   QUnit.equal(this.requests[0].url, '1.ts', 'moved ahead a segment');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 20, '20 bytes');
+  QUnit.equal(loader.mediaTransferDuration, 2, '2 ms (clocks above)');
+  QUnit.equal(loader.mediaRequests, 2, '2 requests');
+});
+
+QUnit.test('adjusts the playlist offset even when segment.end is set if no' +
+           ' buffering progress is made', function() {
+  let sourceBuffer;
+  let playlist;
+
+  playlist = playlistWithDuration(40);
+  playlist.endList = false;
+  loader.playlist(playlist);
+  loader.mimeType(this.mimeType);
+  loader.load();
+  sourceBuffer = mediaSource.sourceBuffers[0];
+
+  // buffer some content and switch playlists on progress
+  this.clock.tick(1);
+  this.requests[0].response = new Uint8Array(10).buffer;
+  this.requests.shift().respond(200, null, '');
+  sourceBuffer.buffered = videojs.createTimeRanges([[0, 5]]);
+  loader.one('progress', function f() {
+    QUnit.equal(playlist.segments[0].end, 5, 'segment.end was set based on the buffer');
+    playlist.segments[0].end = 10;
+  });
+
+  sourceBuffer.trigger('updateend');
+
+  // the next segment doesn't increase the buffer at all
+  QUnit.equal(this.requests[0].url, '0.ts', 'requested the same segment');
+  this.clock.tick(1);
+  this.requests[0].response = new Uint8Array(10).buffer;
+  this.requests.shift().respond(200, null, '');
+  sourceBuffer.trigger('updateend');
+
+  // so the loader should try the next segment
+  QUnit.equal(this.requests[0].url, '1.ts', 'moved ahead a segment');
+});
+
+QUnit.test('adjusts the playlist offset if no buffering progress is made after ' +
+           'several consecutive attempts', function() {
+  let sourceBuffer;
+  let playlist;
+  let errors = 0;
+
+  loader.on('error', () => {
+    errors++;
+  });
+
+  playlist = playlistWithDuration(120);
+  playlist.endList = false;
+  loader.playlist(playlist);
+  loader.mimeType(this.mimeType);
+  loader.load();
+  sourceBuffer = mediaSource.sourceBuffers[0];
+
+  // buffer some content
+  this.clock.tick(1);
+  this.requests[0].response = new Uint8Array(10).buffer;
+  this.requests.shift().respond(200, null, '');
+  sourceBuffer.buffered = videojs.createTimeRanges([[0, 10]]);
+  sourceBuffer.trigger('updateend');
+
+  for (let i = 1; i <= 5; i++) {
+    // the next segment doesn't increase the buffer at all
+    QUnit.equal(this.requests[0].url, (i + '.ts'), 'requested the next segment');
+    this.clock.tick(1);
+    this.requests[0].response = new Uint8Array(10).buffer;
+    this.requests.shift().respond(200, null, '');
+    sourceBuffer.trigger('updateend');
+  }
+  this.clock.tick(1);
+  QUnit.equal(this.requests.length, 0, 'no more requests are made');
+});
+
+QUnit.test('downloads init segments if specified', function() {
+  let playlist = playlistWithDuration(20);
+  let map = {
+    resolvedUri: 'main.mp4',
+    byterange: {
+      length: 20,
+      offset: 0
+    }
+  };
+
+  playlist.segments[0].map = map;
+  playlist.segments[1].map = map;
+  loader.playlist(playlist);
+  loader.mimeType(this.mimeType);
+
+  loader.load();
+  let sourceBuffer = mediaSource.sourceBuffers[0];
+
+  QUnit.equal(this.requests.length, 2, 'made requests');
+
+  // init segment response
+  this.clock.tick(1);
+  QUnit.equal(this.requests[0].url, 'main.mp4', 'requested the init segment');
+  this.requests[0].response = new Uint8Array(20).buffer;
+  this.requests.shift().respond(200, null, '');
+  // 0.ts response
+  this.clock.tick(1);
+  QUnit.equal(this.requests[0].url, '0.ts',
+              'requested the segment');
+  this.requests[0].response = new Uint8Array(20).buffer;
+  this.requests.shift().respond(200, null, '');
+
+  // append the init segment
+  sourceBuffer.buffered = videojs.createTimeRanges([]);
+  sourceBuffer.trigger('updateend');
+  // append the segment
+  sourceBuffer.buffered = videojs.createTimeRanges([[0, 10]]);
+  sourceBuffer.trigger('updateend');
+
+  QUnit.equal(this.requests.length, 1, 'made a request');
+  QUnit.equal(this.requests[0].url, '1.ts',
+              'did not re-request the init segment');
+});
+
+QUnit.test('detects init segment changes and downloads it', function() {
+  let playlist = playlistWithDuration(20);
+
+  playlist.segments[0].map = {
+    resolvedUri: 'init0.mp4',
+    byterange: {
+      length: 20,
+      offset: 0
+    }
+  };
+  playlist.segments[1].map = {
+    resolvedUri: 'init0.mp4',
+    byterange: {
+      length: 20,
+      offset: 20
+    }
+  };
+  loader.playlist(playlist);
+  loader.mimeType(this.mimeType);
+
+  loader.load();
+  let sourceBuffer = mediaSource.sourceBuffers[0];
+
+  QUnit.equal(this.requests.length, 2, 'made requests');
+
+  // init segment response
+  this.clock.tick(1);
+  QUnit.equal(this.requests[0].url, 'init0.mp4', 'requested the init segment');
+  QUnit.equal(this.requests[0].headers.Range, 'bytes=0-19',
+              'requested the init segment byte range');
+  this.requests[0].response = new Uint8Array(20).buffer;
+  this.requests.shift().respond(200, null, '');
+  // 0.ts response
+  this.clock.tick(1);
+  QUnit.equal(this.requests[0].url, '0.ts',
+              'requested the segment');
+  this.requests[0].response = new Uint8Array(20).buffer;
+  this.requests.shift().respond(200, null, '');
+
+  // append the init segment
+  sourceBuffer.buffered = videojs.createTimeRanges([]);
+  sourceBuffer.trigger('updateend');
+  // append the segment
+  sourceBuffer.buffered = videojs.createTimeRanges([[0, 10]]);
+  sourceBuffer.trigger('updateend');
+
+  QUnit.equal(this.requests.length, 2, 'made requests');
+  QUnit.equal(this.requests[0].url, 'init0.mp4', 'requested the init segment');
+  QUnit.equal(this.requests[0].headers.Range, 'bytes=20-39',
+              'requested the init segment byte range');
+  QUnit.equal(this.requests[1].url, '1.ts',
+              'did not re-request the init segment');
 });
 
 QUnit.test('cancels outstanding requests on abort', function() {
@@ -422,6 +637,10 @@ QUnit.test('abort does not cancel segment processing in progress', function() {
 
   loader.abort();
   QUnit.equal(loader.state, 'APPENDING', 'still appending');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('sets the timestampOffset on timeline change', function() {
@@ -443,6 +662,10 @@ QUnit.test('sets the timestampOffset on timeline change', function() {
   this.requests[0].response = new Uint8Array(10).buffer;
   this.requests.shift().respond(200, null, '');
   QUnit.equal(mediaSource.sourceBuffers[0].timestampOffset, 10, 'set timestampOffset');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 20, '20 bytes');
+  QUnit.equal(loader.mediaRequests, 2, '2 requests');
 });
 
 QUnit.test('tracks segment end times as they are buffered', function() {
@@ -460,6 +683,10 @@ QUnit.test('tracks segment end times as they are buffered', function() {
   ]);
   mediaSource.sourceBuffers[0].trigger('updateend');
   QUnit.equal(playlist.segments[0].end, 9.5, 'updated duration');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('segment 404s should trigger an error', function() {
@@ -517,6 +744,10 @@ QUnit.test('fires ended at the end of a playlist', function() {
   mediaSource.sourceBuffers[0].buffered = videojs.createTimeRanges([[0, 10]]);
   mediaSource.sourceBuffers[0].trigger('updateend');
   QUnit.equal(endOfStreams, 1, 'triggered ended');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('live playlists do not trigger ended', function() {
@@ -541,77 +772,10 @@ QUnit.test('live playlists do not trigger ended', function() {
   mediaSource.sourceBuffers[0].buffered = videojs.createTimeRanges([[0, 10]]);
   mediaSource.sourceBuffers[0].trigger('updateend');
   QUnit.equal(endOfStreams, 0, 'did not trigger ended');
-});
 
-QUnit.test('respects the global withCredentials option', function() {
-  let hlsOptions = videojs.options.hls;
-
-  videojs.options.hls = {
-    withCredentials: true
-  };
-  loader = new SegmentLoader({
-    hls: this.fakeHls,
-    currentTime() {
-      return currentTime;
-    },
-    seekable: () => this.seekable,
-    mediaSource
-  });
-  loader.playlist(playlistWithDuration(10, {isEncrypted: true}));
-  loader.mimeType(this.mimeType);
-  loader.load();
-
-  QUnit.equal(this.requests[0].url, '0-key.php', 'requested the first segment\'s key');
-  QUnit.ok(this.requests[0].withCredentials, 'key request used withCredentials');
-  QUnit.equal(this.requests[1].url, '0.ts', 'requested the first segment');
-  QUnit.ok(this.requests[1].withCredentials, 'segment request used withCredentials');
-  videojs.options.hls = hlsOptions;
-});
-
-QUnit.test('respects the withCredentials option', function() {
-  loader = new SegmentLoader({
-    hls: this.fakeHls,
-    currentTime() {
-      return currentTime;
-    },
-    seekable: () => this.seekable,
-    mediaSource,
-    withCredentials: true
-  });
-  loader.playlist(playlistWithDuration(10, {isEncrypted: true}));
-  loader.mimeType(this.mimeType);
-  loader.load();
-
-  QUnit.equal(this.requests[0].url, '0-key.php', 'requested the first segment\'s key');
-  QUnit.ok(this.requests[0].withCredentials, 'key request used withCredentials');
-  QUnit.equal(this.requests[1].url, '0.ts', 'requested the first segment');
-  QUnit.ok(this.requests[1].withCredentials, 'segment request used withCredentials');
-});
-
-QUnit.test('the withCredentials option overrides the global', function() {
-  let hlsOptions = videojs.options.hls;
-
-  videojs.options.hls = {
-    withCredentials: true
-  };
-  loader = new SegmentLoader({
-    hls: this.fakeHls,
-    currentTime() {
-      return currentTime;
-    },
-    mediaSource,
-    seekable: () => this.seekable,
-    withCredentials: false
-  });
-  loader.playlist(playlistWithDuration(10, {isEncrypted: true}));
-  loader.mimeType(this.mimeType);
-  loader.load();
-
-  QUnit.equal(this.requests[0].url, '0-key.php', 'requested the first segment\'s key');
-  QUnit.ok(!this.requests[0].withCredentials, 'overrode key request withCredentials');
-  QUnit.equal(this.requests[1].url, '0.ts', 'requested the first segment');
-  QUnit.ok(!this.requests[1].withCredentials, 'overrode segment request withCredentials');
-  videojs.options.hls = hlsOptions;
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('remains ready if there are no segments', function() {
@@ -750,6 +914,10 @@ QUnit.test('the key is saved to the segment in the correct format', function() {
   QUnit.deepEqual(segment.key.bytes,
                   new Uint32Array([0, 0x01000000, 0x02000000, 0x03000000]),
                   'passed the specified segment key');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaRequests, 1, '1 request was completed');
 });
 
 QUnit.test('supplies media sequence of current segment as the IV by default, if no IV ' +
@@ -780,6 +948,10 @@ function() {
 
   QUnit.deepEqual(segment.key.iv, new Uint32Array([0, 0, 0, 5]),
                   'the IV for the segment is the media sequence');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('segment with key has decrypted bytes appended during processing', function() {
@@ -808,6 +980,10 @@ QUnit.test('segment with key has decrypted bytes appended during processing', fu
   // Allow the decrypter's async stream to run the callback
   this.clock.tick(1);
   QUnit.ok(loader.pendingSegment_.bytes, 'decrypted bytes in segment');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 8, '8 bytes');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('calling load with an encrypted segment waits for both key and segment ' +
@@ -833,6 +1009,10 @@ QUnit.test('calling load with an encrypted segment waits for both key and segmen
   keyRequest.response = new Uint32Array([0, 0, 0, 0]).buffer;
   keyRequest.respond(200, null, '');
   QUnit.equal(loader.state, 'DECRYPTING', 'moves to decrypting state');
+
+  // verify stats
+  QUnit.equal(loader.mediaBytesTransferred, 10, '10 bytes');
+  QUnit.equal(loader.mediaRequests, 1, '1 request');
 });
 
 QUnit.test('key request timeouts reset bandwidth', function() {
@@ -850,11 +1030,29 @@ QUnit.test('key request timeouts reset bandwidth', function() {
   QUnit.ok(isNaN(loader.roundTrip), 'reset round trip time');
 });
 
+QUnit.test('checks the goal buffer configuration every loading opportunity', function() {
+  let playlist = playlistWithDuration(20);
+  let defaultGoal = Config.GOAL_BUFFER_LENGTH;
+  let segmentInfo;
+
+  Config.GOAL_BUFFER_LENGTH = 1;
+  loader.playlist(playlist);
+  loader.mimeType(this.mimeType);
+  loader.load();
+
+  segmentInfo = loader.checkBuffer_(videojs.createTimeRanges([[0, 1]]),
+                                    playlist,
+                                    0);
+  QUnit.ok(!segmentInfo, 'no request generated');
+  Config.GOAL_BUFFER_LENGTH = defaultGoal;
+});
+
 QUnit.module('Segment Loading Calculation', {
   beforeEach() {
     this.env = useFakeEnvironment();
     this.mse = useFakeMediaSource();
     this.hasPlayed = true;
+    this.clock = this.env.clock;
 
     currentTime = 0;
     loader = new SegmentLoader({
@@ -901,7 +1099,7 @@ QUnit.test('does not download the next segment if the buffer is full', function(
   loader.mimeType(this.mimeType);
 
   buffered = videojs.createTimeRanges([
-    [0, 15 + GOAL_BUFFER_LENGTH]
+    [0, 15 + Config.GOAL_BUFFER_LENGTH]
   ]);
   segmentInfo = loader.checkBuffer_(buffered, playlistWithDuration(30), 15);
 
@@ -911,11 +1109,14 @@ QUnit.test('does not download the next segment if the buffer is full', function(
 QUnit.test('downloads the next segment if the buffer is getting low', function() {
   let buffered;
   let segmentInfo;
+  let playlist = playlistWithDuration(30);
 
   loader.mimeType(this.mimeType);
+  loader.playlist(playlist);
 
+  playlist.segments[1].end = 19.999;
   buffered = videojs.createTimeRanges([[0, 19.999]]);
-  segmentInfo = loader.checkBuffer_(buffered, playlistWithDuration(30), 15);
+  segmentInfo = loader.checkBuffer_(buffered, playlist, 15);
 
   QUnit.ok(segmentInfo, 'made a request');
   QUnit.equal(segmentInfo.uri, '2.ts', 'requested the third segment');
@@ -966,22 +1167,6 @@ function() {
   QUnit.ok(!segmentInfo, 'no request was made');
 });
 
-QUnit.test('calculates timestampOffset for discontinuities', function() {
-  let segmentInfo;
-  let playlist;
-
-  loader.mimeType(this.mimeType);
-
-  playlist = playlistWithDuration(60);
-  playlist.segments[3].end = 37.9;
-  playlist.discontinuityStarts = [4];
-  playlist.segments[4].discontinuity = true;
-  playlist.segments[4].timeline = 1;
-
-  segmentInfo = loader.checkBuffer_(videojs.createTimeRanges([[0, 37.9]]), playlist, 36);
-  QUnit.equal(segmentInfo.timestampOffset, 37.9, 'placed the discontinuous segment');
-});
-
 QUnit.test('adjusts calculations based on expired time', function() {
   let buffered;
   let playlist;
@@ -996,8 +1181,26 @@ QUnit.test('adjusts calculations based on expired time', function() {
 
   segmentInfo = loader.checkBuffer_(buffered,
                                     playlist,
-                                    40 - GOAL_BUFFER_LENGTH);
+                                    40 - Config.GOAL_BUFFER_LENGTH);
 
   QUnit.ok(segmentInfo, 'fetched a segment');
   QUnit.equal(segmentInfo.uri, '2.ts', 'accounted for expired time');
+});
+
+QUnit.test('doesn\'t allow more than one monitor buffer timer to be set', function() {
+  let timeoutCount = this.clock.methods.length;
+
+  loader.mimeType(this.mimeType);
+  loader.monitorBuffer_();
+
+  QUnit.equal(this.clock.methods.length, timeoutCount, 'timeout count remains the same');
+
+  loader.monitorBuffer_();
+
+  QUnit.equal(this.clock.methods.length, timeoutCount, 'timeout count remains the same');
+
+  loader.monitorBuffer_();
+  loader.monitorBuffer_();
+
+  QUnit.equal(this.clock.methods.length, timeoutCount, 'timeout count remains the same');
 });

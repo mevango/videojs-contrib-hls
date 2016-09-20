@@ -2,6 +2,58 @@ CHANGELOG
 =========
 
 --------------------
+## 3.5.3 (2016-08-24)
+* Updated videojs-contrib-mediasources to 3.1.5
+  * Updated Mux.js to 2.4.2
+    * Fixed caption-packet sorting to be stable on Chromium
+
+--------------------
+## 3.5.2 (2016-08-17)
+* Changes to the underflow-detection in the gap-skipper to remove restrictions on the size of the gaps it is able to skip
+
+--------------------
+## 3.5.1 (2016-08-16)
+* Fixes an issue where playback can stall when going in/out of fullscreen
+
+--------------------
+## 3.5.0 (2016-08-15)
+* Updated support for #ext-x-cue-out, #ext-x-cue-in, and #ext-x-cue-out-cont to create a single cue spanning the range of time covered by the ad break
+* Updated to videojs-media-sources 3.1.4
+  * Increased the values of the FlashConstants to push more data into flash per chunk-interval
+
+--------------------
+## 3.4.0 (2016-07-29)
+* Added support for #ext-x-cue-out, #ext-x-cue-in, and #ext-x-cue-out-cont via a special TextTrack
+* Added the ability to skip gaps caused by video underflow behavior in Chrome
+
+--------------------
+## 3.3.0 (2016-07-25)
+* No longer timeout segment requests if there is only one playlist left or if we are on the lowest rendition available
+* Fixed a bug where sometimes the first segment was not fetched when it should have been
+
+--------------------
+## 3.2.0 (2016-07-15)
+* Added an algorithm to seek over gaps in the video element's buffer when they are created because of missing video or audio frames
+* Moved the AES decryption logic to it's [own project](https://github.com/videojs/aes-decrypter)
+
+--------------------
+## 3.1.0 (2016-06-09)
+* Added manual rendition selection API via the `representations()` function on each instance of the HlsHandler class
+* Pulled out and moved m3u8 parsing functionality into it's own project at https://github.com/videojs/m3u8-parser
+
+--------------------
+## 3.0.5 (2016-06-02)
+* Fixed a bug where the adaptive bitrate selection algorithm would not switch to media playlists that had already been fetched from the server previously
+
+--------------------
+## 3.0.4 (2016-05-31)
+* Added support for multiple alternate audio tracks
+* New class SegmentLoader contains all buffer maintenence and segment fetching logic
+* New class SourceUpdater tracks the state of asynchronous operations on a SourceBuffer and queues operations for future execution if the SoureBuffer is busy
+* New class MasterPlaylistController now encapsulates operations on the master playlist and coordinates media playlists and segment loaders
+* Bug fixes related to fetching and buffer maintenance
+
+--------------------
 
 ## 2.0.1 (2016-03-11)
 * First release of the ES6 version of the SourceHandler

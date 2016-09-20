@@ -8,7 +8,8 @@
 import resolveUrl from './resolve-url';
 import {mergeOptions} from 'video.js';
 import Stream from './stream';
-import m3u8 from './m3u8';
+import m3u8 from 'm3u8-parser';
+import window from 'global/window';
 
 /**
   * Returns a new array of segments that is the result of merging
@@ -96,6 +97,9 @@ const updateMaster = function(master, media) {
         if (segment.key && !segment.key.resolvedUri) {
           segment.key.resolvedUri = resolveUrl(playlist.resolvedUri, segment.key.uri);
         }
+        if (segment.map && !segment.map.resolvedUri) {
+          segment.map.resolvedUri = resolveUrl(playlist.resolvedUri, segment.map.uri);
+        }
       }
       changed = true;
     }
@@ -177,6 +181,7 @@ const PlaylistLoader = function(srcUrl, hls, withCredentials) {
     // merge this playlist into the master
     update = updateMaster(loader.master, parser.manifest);
     refreshDelay = (parser.manifest.targetDuration || 10) * 1000;
+    loader.targetDuration = parser.manifest.targetDuration;
     if (update) {
       loader.master = update;
       loader.updateMediaPlaylist_(parser.manifest);
@@ -225,6 +230,46 @@ const PlaylistLoader = function(srcUrl, hls, withCredentials) {
       oldRequest.onreadystatechange = null;
       oldRequest.abort();
     }
+  };
+
+  /**
+   * Returns the number of enabled playlists on the master playlist object
+   *
+   * @return {Number} number of eneabled playlists
+   */
+  loader.enabledPlaylists_ = function() {
+    return loader.master.playlists.filter((element, index, array) => {
+      return !element.excludeUntil || element.excludeUntil <= Date.now();
+    }).length;
+  };
+
+  /**
+   * Returns whether the current playlist is the lowest rendition
+   *
+   * @return {Boolean} true if on lowest rendition
+   */
+  loader.isLowestEnabledRendition_ = function() {
+    let media = loader.media();
+
+    if (!media || !media.attributes) {
+      return false;
+    }
+
+    let currentBandwidth = loader.media().attributes.BANDWIDTH || 0;
+
+    return !(loader.master.playlists.filter((element, index, array) => {
+      let enabled = typeof element.excludeUntil === 'undefined' ||
+                      element.excludeUntil <= Date.now();
+
+      if (!enabled) {
+        return false;
+      }
+
+      let item = element.attributes.BANDWIDTH;
+
+      return item <= currentBandwidth;
+
+    }).length > 1);
   };
 
    /**
@@ -448,6 +493,7 @@ const PlaylistLoader = function(srcUrl, hls, withCredentials) {
         for (let groupKey in loader.master.mediaGroups.AUDIO) {
           for (let labelKey in loader.master.mediaGroups.AUDIO[groupKey]) {
             let alternateAudio = loader.master.mediaGroups.AUDIO[groupKey][labelKey];
+
             if (alternateAudio.uri) {
               alternateAudio.resolvedUri =
                 resolveUrl(loader.master.uri, alternateAudio.uri);
@@ -467,6 +513,12 @@ const PlaylistLoader = function(srcUrl, hls, withCredentials) {
       // loaded a media playlist
       // infer a master playlist if none was previously requested
       loader.master = {
+        mediaGroups: {
+          'AUDIO': {},
+          'VIDEO': {},
+          'CLOSED-CAPTIONS': {},
+          'SUBTITLES': {}
+        },
         uri: window.location.href,
         playlists: [{
           uri: srcUrl

@@ -8,6 +8,7 @@ import MediaSource from 'videojs-contrib-media-sources';
 /* eslint-enable */
 import testDataManifests from './test-manifests.js';
 import xhrFactory from '../src/xhr';
+import window from 'global/window';
 
 // a SourceBuffer that tracks updates but otherwise is a noop
 class MockSourceBuffer extends videojs.EventTarget {
@@ -116,7 +117,15 @@ let fakeEnvironment = {
     this.xhr.restore();
     ['warn', 'error'].forEach((level) => {
       if (this.log && this.log[level] && this.log[level].restore) {
-        QUnit.equal(this.log[level].callCount, 0, `no unexpected logs on ${level}`);
+        if (QUnit) {
+          let calls = this.log[level].args.map((args) => {
+            return args.join(', ');
+          }).join('\n  ');
+
+          QUnit.equal(this.log[level].callCount,
+                      0,
+                      'no unexpected logs at level "' + level + '":\n  ' + calls);
+        }
         this.log[level].restore();
       }
     });
@@ -255,7 +264,7 @@ export const openMediaSource = function(player, clock) {
   });
 };
 
-export const standardXHRResponse = function(request) {
+export const standardXHRResponse = function(request, data) {
   if (!request.url) {
     return;
   }
@@ -276,9 +285,12 @@ export const standardXHRResponse = function(request) {
     contentType = 'video/MP2T';
   }
 
+  if (!data) {
+    data = testDataManifests[manifestName];
+  }
+
   request.response = new Uint8Array(16).buffer;
-  request.respond(200, { 'Content-Type': contentType },
-                  testDataManifests[manifestName]);
+  request.respond(200, {'Content-Type': contentType}, data);
 };
 
 // return an absolute version of a page-relative URL
@@ -291,4 +303,39 @@ export const absoluteUrl = function(relativeUrl) {
         .concat(relativeUrl)
         .join('/')
     );
+};
+
+export const playlistWithDuration = function(time, conf) {
+  let result = {
+    targetDuration: 10,
+    mediaSequence: conf && conf.mediaSequence ? conf.mediaSequence : 0,
+    discontinuityStarts: [],
+    segments: [],
+    endList: true
+  };
+  let count = Math.floor(time / 10);
+  let remainder = time % 10;
+  let i;
+  let isEncrypted = conf && conf.isEncrypted;
+
+  for (i = 0; i < count; i++) {
+    result.segments.push({
+      uri: i + '.ts',
+      resolvedUri: i + '.ts',
+      duration: 10
+    });
+    if (isEncrypted) {
+      result.segments[i].key = {
+        uri: i + '-key.php',
+        resolvedUri: i + '-key.php'
+      };
+    }
+  }
+  if (remainder) {
+    result.segments.push({
+      uri: i + '.ts',
+      duration: remainder
+    });
+  }
+  return result;
 };
