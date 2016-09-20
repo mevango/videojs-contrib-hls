@@ -721,7 +721,9 @@ export default class SegmentLoader extends videojs.EventTarget {
             setTimeout(function () {
               self.fillBuffer_();
             },250);
-            return this.trigger('waiting');
+            //@TODO SVEN!!!!
+            if(this.repeats_ == 0)return this.trigger('waiting');
+            return;
           }
       }else{
         var self = this;
