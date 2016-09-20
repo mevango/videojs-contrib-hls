@@ -616,6 +616,8 @@ export default class SegmentLoader extends videojs.EventTarget {
 
     segment = segmentInfo.playlist.segments[segmentInfo.mediaIndex];
 
+    if(segment.done)return;
+
     // optionally, request the decryption key
     if (segment.key) {
       let keyRequestOptions = videojs.mergeOptions(this.xhrOptions_, {
@@ -763,6 +765,7 @@ export default class SegmentLoader extends videojs.EventTarget {
       this.mediaRequests += 1;
       this.mediaTransferDuration += request.roundTripTime || 0;
 
+      segment.done = true;
       if (segment.key) {
         segmentInfo.encryptedBytes = new Uint8Array(request.response);
       } else {
